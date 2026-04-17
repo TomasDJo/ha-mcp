@@ -4,7 +4,7 @@ AI assistant integration for Home Assistant via Model Context Protocol (MCP).
 
 ## About
 
-This add-on enables AI assistants (Claude, ChatGPT, etc.) to control your Home Assistant installation through the Model Context Protocol (MCP). It provides 86+ tools for device control, automation management, entity search, calendars, todo lists, dashboards, backup/restore, history/statistics, camera snapshots, and system queries.
+This add-on enables AI assistants (Claude, ChatGPT, etc.) to control your Home Assistant installation through the Model Context Protocol (MCP). It provides 87+ tools for device control, automation management, entity search, calendars, todo lists, dashboards, backup/restore, history/statistics, camera snapshots, and system queries.
 
 **Key Features:**
 - **Zero Configuration** - Automatically discovers Home Assistant connection
@@ -231,7 +231,7 @@ Custom secret path override. **Leave empty for auto-generation** (recommended).
 
 **Default:** `false`
 
-Replaces the full tool catalog (~86 tools, ~46K tokens) with search-based discovery (~4 proxy tools, ~5K tokens). When enabled, tools are found via `ha_search_tools` and executed through categorized proxies (read/write/delete).
+Replaces the full tool catalog (~87 tools, ~46K tokens) with search-based discovery (~4 proxy tools, ~5K tokens). When enabled, tools are found via `ha_search_tools` and executed through categorized proxies (read/write/delete).
 
 **When to enable:**
 - Models **without native deferred tool support** — this includes OpenAI-compatible local models, and also **Claude Haiku** which does not use Claude's built-in deferred tool loading. Haiku users will see significant token savings with this enabled.
@@ -329,7 +329,7 @@ If the add-on is slow or unresponsive:
 
 <!-- ADDON_TOOLS_START -->
 
-The add-on provides 86+ MCP tools for controlling Home Assistant:
+The add-on provides 87+ MCP tools for controlling Home Assistant:
 
 > Tools marked **(beta — dev channel only)** are gated behind feature flags and ship with the dev channel add-on only. See [docs/beta.md](https://github.com/homeassistant-ai/ha-mcp/blob/master/docs/beta.md) for setup and caveats.
 
@@ -357,7 +357,8 @@ The add-on provides 86+ MCP tools for controlling Home Assistant:
 ### Calendar
 - `ha_config_get_calendar_events` — Retrieve calendar events from a calendar entity.
 - `ha_config_remove_calendar_event` — Delete an event from a calendar.
-- `ha_config_set_calendar_event` — Create a new event in a calendar.
+- `ha_config_set_calendar_event` — Create a new event in a calendar, optionally recurring.
+- `ha_config_update_calendar_event` — Update an existing calendar event.
 
 ### Camera
 - `ha_get_camera_image` — Retrieve a snapshot image from a Home Assistant camera entity.

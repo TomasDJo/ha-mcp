@@ -456,7 +456,7 @@
   {
     "name": "ha_config_set_calendar_event",
     "title": "Create or Update Calendar Event",
-    "description": "Create a new event in a calendar.\n\nCreates a calendar event using the calendar.create_event service.\n\n**Parameters:**\n- entity_id: Calendar entity ID (e.g., 'calendar.family')\n- summary: Event title/summary\n- start: Event start datetime in ISO format\n- end: Event end datetime in ISO format\n- description: Optional event description\n- location: Optional event location\n\n**Example Usage:**\n```python\n# Create a simple event\nresult = ha_config_set_calendar_event(\n    \"calendar.family\",\n    summary=\"Doctor appointment\",\n    start=\"2024-01-15T14:00:00\",\n    end=\"2024-01-15T15:00:00\"\n)\n\n# Create an event with details\nresult = ha_config_set_calendar_event(\n    \"calendar.work\",\n    summary=\"Team meeting\",\n    start=\"2024-01-16T10:00:00\",\n    end=\"2024-01-16T11:00:00\",\n    description=\"Weekly sync meeting\",\n    location=\"Conference Room A\"\n)\n```\n\n**Returns:**\n- Success status and event details",
+    "description": "Create a new event in a calendar, optionally recurring.\n\nCreates a calendar event using the calendar.create_event service.\n\n**Parameters:**\n- entity_id: Calendar entity ID (e.g., 'calendar.family')\n- summary: Event title/summary\n- start: Event start datetime in ISO format\n- end: Event end datetime in ISO format\n- description: Optional event description\n- location: Optional event location\n- recurrence_frequency: DAILY, WEEKLY, MONTHLY, or YEARLY (makes the event recurring)\n- recurrence_interval: Every N periods (default 1, e.g., 2 = every other week)\n- recurrence_count: Total occurrences (mutually exclusive with recurrence_until)\n- recurrence_until: End date for recurrence (mutually exclusive with recurrence_count)\n- recurrence_by_day: Days for weekly recurrence (e.g., 'MO,WE,FR')\n\n**Example Usage:**\n```python\n# Create a simple event\nresult = ha_config_set_calendar_event(\n    \"calendar.family\",\n    summary=\"Doctor appointment\",\n    start=\"2024-01-15T14:00:00\",\n    end=\"2024-01-15T15:00:00\"\n)\n\n# Create a weekly recurring event every Monday and Wednesday, 10 times\nresult = ha_config_set_calendar_event(\n    \"calendar.work\",\n    summary=\"Team meeting\",\n    start=\"2024-01-16T10:00:00\",\n    end=\"2024-01-16T11:00:00\",\n    description=\"Weekly sync meeting\",\n    location=\"Conference Room A\",\n    recurrence_frequency=\"WEEKLY\",\n    recurrence_by_day=\"MO,WE\",\n    recurrence_count=10,\n)\n\n# Create a daily standup until end of quarter\nresult = ha_config_set_calendar_event(\n    \"calendar.work\",\n    summary=\"Daily standup\",\n    start=\"2024-01-02T09:00:00\",\n    end=\"2024-01-02T09:15:00\",\n    recurrence_frequency=\"DAILY\",\n    recurrence_by_day=\"MO,TU,WE,TH,FR\",\n    recurrence_until=\"2024-03-31\",\n)\n```\n\n**Returns:**\n- Success status and event details",
     "inputSchema": {
       "properties": {
         "entity_id": {
@@ -478,6 +478,26 @@
         "location": {
           "type": "Annotated[str | None, Field(description='Optional event location', default=None)]",
           "default": null
+        },
+        "recurrence_frequency": {
+          "type": "Annotated[Literal['DAILY', 'WEEKLY', 'MONTHLY', 'YEARLY'] | None, Field(description='Recurrence frequency. Set this to make the event recurring.', default=None)]",
+          "default": null
+        },
+        "recurrence_interval": {
+          "type": "Annotated[int | None, Field(description='Repeat every N periods (e.g., 2 = every other week). Defaults to 1.', default=None, ge=1)]",
+          "default": null
+        },
+        "recurrence_count": {
+          "type": "Annotated[int | None, Field(description='Total number of occurrences. Mutually exclusive with recurrence_until.', default=None, ge=1)]",
+          "default": null
+        },
+        "recurrence_until": {
+          "type": "Annotated[str | None, Field(description=\"Recurrence end date in ISO format (e.g., '2024-12-31'). Mutually exclusive with recurrence_count.\", default=None)]",
+          "default": null
+        },
+        "recurrence_by_day": {
+          "type": "Annotated[str | None, Field(description=\"Comma-separated days for weekly recurrence (e.g., 'MO,WE,FR'). Valid: MO,TU,WE,TH,FR,SA,SU.\", default=None)]",
+          "default": null
         }
       },
       "required": [
@@ -489,6 +509,85 @@
     },
     "annotations": {
       "destructiveHint": true
+    },
+    "tags": [
+      "Calendar"
+    ],
+    "source_file": "tools_calendar.py"
+  },
+  {
+    "name": "ha_config_update_calendar_event",
+    "title": "Update Calendar Event",
+    "description": "Update an existing calendar event.\n\nUpdates a calendar event using the calendar.update_event service.\nThis service is WebSocket-only in Home Assistant; the tool automatically\nuses the WebSocket transport.\n\n**Parameters:**\n- entity_id: Calendar entity ID (e.g., 'calendar.family')\n- uid: Unique identifier of the event to update\n- summary, description, location: New field values (optional)\n- start, end: New start/end datetime in ISO format (optional)\n- recurrence_id, recurrence_range: For recurring event instances (optional)\n- recurrence_frequency, recurrence_interval, recurrence_count, recurrence_until, recurrence_by_day: Set or change recurrence (optional)\n- recurrence_remove: Set to true to remove recurrence entirely (optional)\n\n**Returns:**\n- Success status and the fields that were updated",
+    "inputSchema": {
+      "properties": {
+        "entity_id": {
+          "type": "Annotated[str, Field(description=\"Calendar entity ID (e.g., 'calendar.family')\")]"
+        },
+        "uid": {
+          "type": "Annotated[str, Field(description='Unique identifier of the event to update')]"
+        },
+        "summary": {
+          "type": "Annotated[str | None, Field(description='New event title/summary', default=None)]",
+          "default": null
+        },
+        "description": {
+          "type": "Annotated[str | None, Field(description='New event description', default=None)]",
+          "default": null
+        },
+        "location": {
+          "type": "Annotated[str | None, Field(description='New event location', default=None)]",
+          "default": null
+        },
+        "start": {
+          "type": "Annotated[str | None, Field(description='New event start datetime in ISO format', default=None)]",
+          "default": null
+        },
+        "end": {
+          "type": "Annotated[str | None, Field(description='New event end datetime in ISO format', default=None)]",
+          "default": null
+        },
+        "recurrence_id": {
+          "type": "Annotated[str | None, Field(description='Optional recurrence ID for recurring events', default=None)]",
+          "default": null
+        },
+        "recurrence_range": {
+          "type": "Annotated[str | None, Field(description=\"Optional recurrence range ('THIS_AND_FUTURE' to apply to this and future occurrences)\", default=None)]",
+          "default": null
+        },
+        "recurrence_frequency": {
+          "type": "Annotated[Literal['DAILY', 'WEEKLY', 'MONTHLY', 'YEARLY'] | None, Field(description='Set or change recurrence frequency. Mutually exclusive with recurrence_remove.', default=None)]",
+          "default": null
+        },
+        "recurrence_interval": {
+          "type": "Annotated[int | None, Field(description='Repeat every N periods (e.g., 2 = every other week). Defaults to 1.', default=None, ge=1)]",
+          "default": null
+        },
+        "recurrence_count": {
+          "type": "Annotated[int | None, Field(description='Total number of occurrences. Mutually exclusive with recurrence_until.', default=None, ge=1)]",
+          "default": null
+        },
+        "recurrence_until": {
+          "type": "Annotated[str | None, Field(description='Recurrence end date in ISO format. Mutually exclusive with recurrence_count.', default=None)]",
+          "default": null
+        },
+        "recurrence_by_day": {
+          "type": "Annotated[str | None, Field(description=\"Comma-separated days for weekly recurrence (e.g., 'MO,WE,FR').\", default=None)]",
+          "default": null
+        },
+        "recurrence_remove": {
+          "type": "Annotated[bool | None, Field(description='Set to true to remove recurrence and make the event a single occurrence. Mutually exclusive with recurrence_frequency.', default=None)]",
+          "default": null
+        }
+      },
+      "required": [
+        "entity_id",
+        "uid"
+      ]
+    },
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": true
     },
     "tags": [
       "Calendar"
