@@ -183,8 +183,8 @@ class CalendarTools:
                 }
             )
 
-            # Response contains an "events" list
-            events = response.get("events", []) if isinstance(response, dict) else []
+            # WS client wraps response as {"success": ..., "result": {...}}
+            events = response.get("result", {}).get("events", []) if isinstance(response, dict) else []
 
             # Limit results
             limited_events = events[:max_results]
