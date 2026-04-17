@@ -15,6 +15,7 @@ from fastmcp.exceptions import ToolError
 from fastmcp.tools import tool
 from pydantic import Field
 
+from ..client.rest_client import HomeAssistantAPIError
 from ..errors import ErrorCode, create_error_response
 from .helpers import (
     exception_to_structured_error,
@@ -24,6 +25,34 @@ from .helpers import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+async def _call_calendar_service(
+    client: Any, service: str, service_data: dict[str, Any]
+) -> Any:
+    """Call a calendar.* service, falling back to WebSocket on HTTP 400.
+
+    HA's ``calendar.delete_event`` and ``calendar.update_event`` services are
+    WebSocket-only and return 400 via REST. ``calendar.create_event`` works
+    over REST. Try REST first; on 400, retry via WS so all three paths work
+    through a single helper.
+    """
+    try:
+        return await client.call_service("calendar", service, service_data)
+    except HomeAssistantAPIError as err:
+        if err.status_code != 400:
+            raise
+        logger.debug(
+            f"calendar.{service} returned 400 over REST; retrying via WebSocket"
+        )
+        return await client.send_websocket_message(
+            {
+                "type": "call_service",
+                "domain": "calendar",
+                "service": service,
+                "service_data": service_data,
+            }
+        )
 
 
 class CalendarTools:
@@ -245,8 +274,8 @@ class CalendarTools:
             if location:
                 service_data["location"] = location
 
-            # Call the calendar.create_event service
-            result = await self._client.call_service("calendar", "create_event", service_data)
+            # Call the calendar.create_event service (REST, with WS fallback)
+            result = await _call_calendar_service(self._client, "create_event", service_data)
 
             return {
                 "success": True,
@@ -365,8 +394,8 @@ class CalendarTools:
             if recurrence_range:
                 service_data["recurrence_range"] = recurrence_range
 
-            # Call the calendar.delete_event service
-            result = await self._client.call_service("calendar", "delete_event", service_data)
+            # calendar.delete_event is WebSocket-only; helper falls back to WS on 400
+            result = await _call_calendar_service(self._client, "delete_event", service_data)
 
             return {
                 "success": True,
@@ -399,6 +428,135 @@ class CalendarTools:
                 suggestions.insert(0, "This calendar does not support event deletion")
 
             exception_to_structured_error(error, context={"entity_id": entity_id, "uid": uid}, suggestions=suggestions)
+
+
+    @tool(
+        name="ha_config_update_calendar_event",
+        tags={"Calendar"},
+        annotations={"destructiveHint": True, "idempotentHint": True, "title": "Update Calendar Event"},
+    )
+    @log_tool_usage
+    async def ha_config_update_calendar_event(
+        self,
+        entity_id: Annotated[
+            str, Field(description="Calendar entity ID (e.g., 'calendar.family')")
+        ],
+        uid: Annotated[str, Field(description="Unique identifier of the event to update")],
+        summary: Annotated[
+            str | None, Field(description="New event title/summary", default=None)
+        ] = None,
+        description: Annotated[
+            str | None, Field(description="New event description", default=None)
+        ] = None,
+        location: Annotated[
+            str | None, Field(description="New event location", default=None)
+        ] = None,
+        start: Annotated[
+            str | None,
+            Field(description="New event start datetime in ISO format", default=None),
+        ] = None,
+        end: Annotated[
+            str | None,
+            Field(description="New event end datetime in ISO format", default=None),
+        ] = None,
+        recurrence_id: Annotated[
+            str | None,
+            Field(description="Optional recurrence ID for recurring events", default=None),
+        ] = None,
+        recurrence_range: Annotated[
+            str | None,
+            Field(
+                description="Optional recurrence range ('THIS_AND_FUTURE' to apply to this and future occurrences)",
+                default=None,
+            ),
+        ] = None,
+    ) -> dict[str, Any]:
+        """
+        Update an existing calendar event.
+
+        Updates a calendar event using the calendar.update_event service.
+        This service is WebSocket-only in Home Assistant; the tool automatically
+        uses the WebSocket transport.
+
+        **Parameters:**
+        - entity_id: Calendar entity ID (e.g., 'calendar.family')
+        - uid: Unique identifier of the event to update
+        - summary, description, location: New field values (optional)
+        - start, end: New start/end datetime in ISO format (optional)
+        - recurrence_id, recurrence_range: For recurring event instances (optional)
+
+        **Returns:**
+        - Success status and the fields that were updated
+        """
+        try:
+            if not entity_id.startswith("calendar."):
+                raise_tool_error(create_error_response(
+                    ErrorCode.VALIDATION_INVALID_PARAMETER,
+                    f"Invalid calendar entity ID: {entity_id}. Must start with 'calendar.'",
+                    context={"entity_id": entity_id},
+                    suggestions=[
+                        "Use ha_search_entities(query='calendar', domain_filter='calendar') to find calendar entities",
+                        "Calendar entity IDs start with 'calendar.' prefix",
+                    ],
+                ))
+
+            service_data: dict[str, Any] = {"entity_id": entity_id, "uid": uid}
+            if summary is not None:
+                service_data["summary"] = summary
+            if description is not None:
+                service_data["description"] = description
+            if location is not None:
+                service_data["location"] = location
+            if start is not None:
+                service_data["start_date_time"] = start
+            if end is not None:
+                service_data["end_date_time"] = end
+            if recurrence_id:
+                service_data["recurrence_id"] = recurrence_id
+            if recurrence_range:
+                service_data["recurrence_range"] = recurrence_range
+
+            if len(service_data) <= 2:
+                raise_tool_error(create_error_response(
+                    ErrorCode.VALIDATION_INVALID_PARAMETER,
+                    "No fields to update. Provide at least one of: summary, description, location, start, end.",
+                    context={"entity_id": entity_id, "uid": uid},
+                ))
+
+            result = await _call_calendar_service(self._client, "update_event", service_data)
+
+            return {
+                "success": True,
+                "entity_id": entity_id,
+                "uid": uid,
+                "updated_fields": {
+                    k: v for k, v in service_data.items() if k not in ("entity_id", "uid")
+                },
+                "result": result,
+                "message": f"Successfully updated event '{uid}' in {entity_id}",
+            }
+
+        except ToolError:
+            raise
+        except Exception as error:
+            logger.error(f"Failed to update calendar event in {entity_id}: {error}")
+
+            suggestions = [
+                f"Verify calendar entity '{entity_id}' exists",
+                f"Verify event with UID '{uid}' exists in the calendar",
+                "Use ha_config_get_calendar_events() to find the correct event UID",
+                "Some calendar integrations may not support event updates",
+            ]
+
+            error_str = str(error)
+            if "404" in error_str or "not found" in error_str.lower():
+                suggestions.insert(0, f"Calendar entity '{entity_id}' or event '{uid}' not found")
+            if "not supported" in error_str.lower():
+                suggestions.insert(0, "This calendar does not support event updates")
+
+            exception_to_structured_error(
+                error, context={"entity_id": entity_id, "uid": uid}, suggestions=suggestions
+            )
 
 
 def register_calendar_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
