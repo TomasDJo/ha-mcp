@@ -30,29 +30,21 @@ logger = logging.getLogger(__name__)
 async def _call_calendar_service(
     client: Any, service: str, service_data: dict[str, Any]
 ) -> Any:
-    """Call a calendar.* service, falling back to WebSocket on HTTP 400.
+    """Call a calendar.* service via WebSocket.
 
-    HA's ``calendar.delete_event`` and ``calendar.update_event`` services are
-    WebSocket-only and return 400 via REST. ``calendar.create_event`` works
-    over REST. Try REST first; on 400, retry via WS so all three paths work
-    through a single helper.
+    All calendar mutation services use WebSocket exclusively.
+    ``delete_event`` and ``update_event`` are WS-only in HA, and
+    ``create_event`` rejects ``rrule`` over REST.  Using WS for
+    everything avoids silent failures and mixed transport complexity.
     """
-    try:
-        return await client.call_service("calendar", service, service_data)
-    except HomeAssistantAPIError as err:
-        if err.status_code != 400:
-            raise
-        logger.debug(
-            f"calendar.{service} returned 400 over REST; retrying via WebSocket"
-        )
-        return await client.send_websocket_message(
-            {
-                "type": "call_service",
-                "domain": "calendar",
-                "service": service,
-                "service_data": service_data,
-            }
-        )
+    return await client.send_websocket_message(
+        {
+            "type": "call_service",
+            "domain": "calendar",
+            "service": service,
+            "service_data": service_data,
+        }
+    )
 
 
 _VALID_DAYS = {"MO", "TU", "WE", "TH", "FR", "SA", "SU"}
@@ -179,18 +171,20 @@ class CalendarTools:
                 end_date = now + timedelta(days=7)
                 end = end_date.isoformat()
 
-            # Build the API endpoint for calendar events
-            # Home Assistant uses: GET /api/calendars/{entity_id}?start=...&end=...
-            params = {"start": start, "end": end}
-
-            # Use the REST client to fetch calendar events
-            # The endpoint is /calendars/{entity_id} (note: without /api prefix as client adds it)
-            response = await self._client._request(
-                "GET", f"/calendars/{entity_id}", params=params
+            # Use WebSocket calendar/event/list to get events with UIDs.
+            # The REST endpoint (/calendars/{entity_id}) does not return UIDs,
+            # which are required for update/delete operations.
+            response = await self._client.send_websocket_message(
+                {
+                    "type": "calendar/event/list",
+                    "entity_id": entity_id,
+                    "start_date_time": start,
+                    "end_date_time": end,
+                }
             )
 
-            # Response is a list of events
-            events = response if isinstance(response, list) else []
+            # Response contains an "events" list
+            events = response.get("events", []) if isinstance(response, dict) else []
 
             # Limit results
             limited_events = events[:max_results]
