@@ -11,6 +11,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /
 WORKDIR /app
 
 # Clone the repo (uses master branch)
+# CACHE_BUST: change this value to force a fresh git clone on rebuild
+ARG CACHE_BUST=2
 ARG REPO_URL=https://github.com/TomasDJo/ha-mcp.git
 ARG REPO_BRANCH=master
 RUN git clone --depth 1 --branch ${REPO_BRANCH} ${REPO_URL} /repo
