@@ -9,7 +9,7 @@ Use ha_search_entities(query='calendar', domain_filter='calendar') to find calen
 
 import logging
 from datetime import datetime, timedelta
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from fastmcp.exceptions import ToolError
 from fastmcp.tools import tool
@@ -53,6 +53,45 @@ async def _call_calendar_service(
                 "service_data": service_data,
             }
         )
+
+
+_VALID_DAYS = {"MO", "TU", "WE", "TH", "FR", "SA", "SU"}
+
+
+def _build_rrule(
+    frequency: str,
+    interval: int | None = None,
+    count: int | None = None,
+    until: str | None = None,
+    by_day: str | None = None,
+) -> str:
+    """Build an RFC 5545 RRULE string from user-friendly parameters."""
+    parts = [f"FREQ={frequency}"]
+
+    if interval is not None and interval > 1:
+        parts.append(f"INTERVAL={interval}")
+
+    if by_day:
+        days = [d.strip().upper() for d in by_day.split(",")]
+        invalid = [d for d in days if d not in _VALID_DAYS]
+        if invalid:
+            raise ValueError(
+                f"Invalid day(s): {', '.join(invalid)}. "
+                f"Valid values: {', '.join(sorted(_VALID_DAYS))}"
+            )
+        parts.append(f"BYDAY={','.join(days)}")
+
+    if count is not None and until is not None:
+        raise ValueError("Cannot specify both 'recurrence_count' and 'recurrence_until'")
+    if count is not None:
+        parts.append(f"COUNT={count}")
+    elif until is not None:
+        dt = until.replace("-", "").replace(":", "").replace("T", "T")
+        if "T" not in dt:
+            dt += "T235959Z"
+        parts.append(f"UNTIL={dt}")
+
+    return ";".join(parts)
 
 
 class CalendarTools:
@@ -210,9 +249,46 @@ class CalendarTools:
         location: Annotated[
             str | None, Field(description="Optional event location", default=None)
         ] = None,
+        recurrence_frequency: Annotated[
+            Literal["DAILY", "WEEKLY", "MONTHLY", "YEARLY"] | None,
+            Field(
+                description="Recurrence frequency. Set this to make the event recurring.",
+                default=None,
+            ),
+        ] = None,
+        recurrence_interval: Annotated[
+            int | None,
+            Field(
+                description="Repeat every N periods (e.g., 2 = every other week). Defaults to 1.",
+                default=None,
+                ge=1,
+            ),
+        ] = None,
+        recurrence_count: Annotated[
+            int | None,
+            Field(
+                description="Total number of occurrences. Mutually exclusive with recurrence_until.",
+                default=None,
+                ge=1,
+            ),
+        ] = None,
+        recurrence_until: Annotated[
+            str | None,
+            Field(
+                description="Recurrence end date in ISO format (e.g., '2024-12-31'). Mutually exclusive with recurrence_count.",
+                default=None,
+            ),
+        ] = None,
+        recurrence_by_day: Annotated[
+            str | None,
+            Field(
+                description="Comma-separated days for weekly recurrence (e.g., 'MO,WE,FR'). Valid: MO,TU,WE,TH,FR,SA,SU.",
+                default=None,
+            ),
+        ] = None,
     ) -> dict[str, Any]:
         """
-        Create a new event in a calendar.
+        Create a new event in a calendar, optionally recurring.
 
         Creates a calendar event using the calendar.create_event service.
 
@@ -223,6 +299,11 @@ class CalendarTools:
         - end: Event end datetime in ISO format
         - description: Optional event description
         - location: Optional event location
+        - recurrence_frequency: DAILY, WEEKLY, MONTHLY, or YEARLY (makes the event recurring)
+        - recurrence_interval: Every N periods (default 1, e.g., 2 = every other week)
+        - recurrence_count: Total occurrences (mutually exclusive with recurrence_until)
+        - recurrence_until: End date for recurrence (mutually exclusive with recurrence_count)
+        - recurrence_by_day: Days for weekly recurrence (e.g., 'MO,WE,FR')
 
         **Example Usage:**
         ```python
@@ -234,14 +315,28 @@ class CalendarTools:
             end="2024-01-15T15:00:00"
         )
 
-        # Create an event with details
+        # Create a weekly recurring event every Monday and Wednesday, 10 times
         result = ha_config_set_calendar_event(
             "calendar.work",
             summary="Team meeting",
             start="2024-01-16T10:00:00",
             end="2024-01-16T11:00:00",
             description="Weekly sync meeting",
-            location="Conference Room A"
+            location="Conference Room A",
+            recurrence_frequency="WEEKLY",
+            recurrence_by_day="MO,WE",
+            recurrence_count=10,
+        )
+
+        # Create a daily standup until end of quarter
+        result = ha_config_set_calendar_event(
+            "calendar.work",
+            summary="Daily standup",
+            start="2024-01-02T09:00:00",
+            end="2024-01-02T09:15:00",
+            recurrence_frequency="DAILY",
+            recurrence_by_day="MO,TU,WE,TH,FR",
+            recurrence_until="2024-03-31",
         )
         ```
 
@@ -274,19 +369,47 @@ class CalendarTools:
             if location:
                 service_data["location"] = location
 
+            rrule: str | None = None
+            if recurrence_frequency:
+                try:
+                    rrule = _build_rrule(
+                        frequency=recurrence_frequency,
+                        interval=recurrence_interval,
+                        count=recurrence_count,
+                        until=recurrence_until,
+                        by_day=recurrence_by_day,
+                    )
+                except ValueError as ve:
+                    raise_tool_error(create_error_response(
+                        ErrorCode.VALIDATION_INVALID_PARAMETER,
+                        str(ve),
+                        context={"recurrence_frequency": recurrence_frequency},
+                    ))
+                service_data["rrule"] = rrule
+            elif any(p is not None for p in (recurrence_interval, recurrence_count, recurrence_until, recurrence_by_day)):
+                raise_tool_error(create_error_response(
+                    ErrorCode.VALIDATION_INVALID_PARAMETER,
+                    "recurrence_frequency is required when using other recurrence parameters",
+                    suggestions=["Set recurrence_frequency to DAILY, WEEKLY, MONTHLY, or YEARLY"],
+                ))
+
             # Call the calendar.create_event service (REST, with WS fallback)
             result = await _call_calendar_service(self._client, "create_event", service_data)
+
+            event_info: dict[str, Any] = {
+                "summary": summary,
+                "start": start,
+                "end": end,
+                "description": description,
+                "location": location,
+            }
+            if rrule:
+                event_info["rrule"] = rrule
 
             return {
                 "success": True,
                 "entity_id": entity_id,
-                "event": {
-                    "summary": summary,
-                    "start": start,
-                    "end": end,
-                    "description": description,
-                    "location": location,
-                },
+                "event": event_info,
                 "result": result,
                 "message": f"Successfully created event '{summary}' in {entity_id}",
             }
@@ -470,6 +593,50 @@ class CalendarTools:
                 default=None,
             ),
         ] = None,
+        recurrence_frequency: Annotated[
+            Literal["DAILY", "WEEKLY", "MONTHLY", "YEARLY"] | None,
+            Field(
+                description="Set or change recurrence frequency. Mutually exclusive with recurrence_remove.",
+                default=None,
+            ),
+        ] = None,
+        recurrence_interval: Annotated[
+            int | None,
+            Field(
+                description="Repeat every N periods (e.g., 2 = every other week). Defaults to 1.",
+                default=None,
+                ge=1,
+            ),
+        ] = None,
+        recurrence_count: Annotated[
+            int | None,
+            Field(
+                description="Total number of occurrences. Mutually exclusive with recurrence_until.",
+                default=None,
+                ge=1,
+            ),
+        ] = None,
+        recurrence_until: Annotated[
+            str | None,
+            Field(
+                description="Recurrence end date in ISO format. Mutually exclusive with recurrence_count.",
+                default=None,
+            ),
+        ] = None,
+        recurrence_by_day: Annotated[
+            str | None,
+            Field(
+                description="Comma-separated days for weekly recurrence (e.g., 'MO,WE,FR').",
+                default=None,
+            ),
+        ] = None,
+        recurrence_remove: Annotated[
+            bool | None,
+            Field(
+                description="Set to true to remove recurrence and make the event a single occurrence. Mutually exclusive with recurrence_frequency.",
+                default=None,
+            ),
+        ] = None,
     ) -> dict[str, Any]:
         """
         Update an existing calendar event.
@@ -484,6 +651,8 @@ class CalendarTools:
         - summary, description, location: New field values (optional)
         - start, end: New start/end datetime in ISO format (optional)
         - recurrence_id, recurrence_range: For recurring event instances (optional)
+        - recurrence_frequency, recurrence_interval, recurrence_count, recurrence_until, recurrence_by_day: Set or change recurrence (optional)
+        - recurrence_remove: Set to true to remove recurrence entirely (optional)
 
         **Returns:**
         - Success status and the fields that were updated
@@ -516,10 +685,41 @@ class CalendarTools:
             if recurrence_range:
                 service_data["recurrence_range"] = recurrence_range
 
+            if recurrence_remove and recurrence_frequency:
+                raise_tool_error(create_error_response(
+                    ErrorCode.VALIDATION_INVALID_PARAMETER,
+                    "Cannot set both recurrence_remove and recurrence_frequency",
+                    suggestions=["Use recurrence_remove=true to remove recurrence, or recurrence_frequency to set/change it"],
+                ))
+
+            if recurrence_remove:
+                service_data["rrule"] = ""
+            elif recurrence_frequency:
+                try:
+                    service_data["rrule"] = _build_rrule(
+                        frequency=recurrence_frequency,
+                        interval=recurrence_interval,
+                        count=recurrence_count,
+                        until=recurrence_until,
+                        by_day=recurrence_by_day,
+                    )
+                except ValueError as ve:
+                    raise_tool_error(create_error_response(
+                        ErrorCode.VALIDATION_INVALID_PARAMETER,
+                        str(ve),
+                        context={"recurrence_frequency": recurrence_frequency},
+                    ))
+            elif any(p is not None for p in (recurrence_interval, recurrence_count, recurrence_until, recurrence_by_day)):
+                raise_tool_error(create_error_response(
+                    ErrorCode.VALIDATION_INVALID_PARAMETER,
+                    "recurrence_frequency is required when using other recurrence parameters",
+                    suggestions=["Set recurrence_frequency to DAILY, WEEKLY, MONTHLY, or YEARLY"],
+                ))
+
             if len(service_data) <= 2:
                 raise_tool_error(create_error_response(
                     ErrorCode.VALIDATION_INVALID_PARAMETER,
-                    "No fields to update. Provide at least one of: summary, description, location, start, end.",
+                    "No fields to update. Provide at least one of: summary, description, location, start, end, recurrence_frequency, or recurrence_remove.",
                     context={"entity_id": entity_id, "uid": uid},
                 ))
 
