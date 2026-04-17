@@ -15,7 +15,6 @@ from fastmcp.exceptions import ToolError
 from fastmcp.tools import tool
 from pydantic import Field
 
-from ..client.rest_client import HomeAssistantAPIError
 from ..errors import ErrorCode, create_error_response
 from .helpers import (
     exception_to_structured_error,
@@ -27,24 +26,64 @@ from .helpers import (
 logger = logging.getLogger(__name__)
 
 
-async def _call_calendar_service(
-    client: Any, service: str, service_data: dict[str, Any]
+async def _ws_calendar_create(
+    client: Any, entity_id: str, event_data: dict[str, Any]
 ) -> Any:
-    """Call a calendar.* service via WebSocket.
+    """Create a calendar event via the dedicated WS command.
 
-    All calendar mutation services use WebSocket exclusively.
-    ``delete_event`` and ``update_event`` are WS-only in HA, and
-    ``create_event`` rejects ``rrule`` over REST.  Using WS for
-    everything avoids silent failures and mixed transport complexity.
+    Uses ``calendar/event/create`` which supports ``rrule``.
+    The ``call_service`` path rejects ``rrule`` as an unknown key.
+    Event fields use ``dtstart``/``dtend`` naming.
     """
     return await client.send_websocket_message(
         {
-            "type": "call_service",
-            "domain": "calendar",
-            "service": service,
-            "service_data": service_data,
+            "type": "calendar/event/create",
+            "entity_id": entity_id,
+            "event": event_data,
         }
     )
+
+
+async def _ws_calendar_update(
+    client: Any,
+    entity_id: str,
+    uid: str,
+    event_data: dict[str, Any],
+    recurrence_id: str | None = None,
+    recurrence_range: str | None = None,
+) -> Any:
+    """Update a calendar event via the dedicated WS command."""
+    msg: dict[str, Any] = {
+        "type": "calendar/event/update",
+        "entity_id": entity_id,
+        "uid": uid,
+        "event": event_data,
+    }
+    if recurrence_id:
+        msg["recurrence_id"] = recurrence_id
+    if recurrence_range:
+        msg["recurrence_range"] = recurrence_range
+    return await client.send_websocket_message(msg)
+
+
+async def _ws_calendar_delete(
+    client: Any,
+    entity_id: str,
+    uid: str,
+    recurrence_id: str | None = None,
+    recurrence_range: str | None = None,
+) -> Any:
+    """Delete a calendar event via the dedicated WS command."""
+    msg: dict[str, Any] = {
+        "type": "calendar/event/delete",
+        "entity_id": entity_id,
+        "uid": uid,
+    }
+    if recurrence_id:
+        msg["recurrence_id"] = recurrence_id
+    if recurrence_range:
+        msg["recurrence_range"] = recurrence_range
+    return await client.send_websocket_message(msg)
 
 
 _VALID_DAYS = {"MO", "TU", "WE", "TH", "FR", "SA", "SU"}
@@ -171,20 +210,14 @@ class CalendarTools:
                 end_date = now + timedelta(days=7)
                 end = end_date.isoformat()
 
-            # Use WebSocket calendar/event/list to get events with UIDs.
-            # The REST endpoint (/calendars/{entity_id}) does not return UIDs,
-            # which are required for update/delete operations.
-            response = await self._client.send_websocket_message(
-                {
-                    "type": "calendar/event/list",
-                    "entity_id": entity_id,
-                    "start_date_time": start,
-                    "end_date_time": end,
-                }
+            # REST GET /api/calendars/{entity_id} returns events including
+            # uid, recurrence_id, and rrule fields.
+            params = {"start": start, "end": end}
+            response = await self._client._request(
+                "GET", f"/calendars/{entity_id}", params=params
             )
 
-            # WS client wraps response as {"success": ..., "result": {...}}
-            events = response.get("result", {}).get("events", []) if isinstance(response, dict) else []
+            events = response if isinstance(response, list) else []
 
             # Limit results
             limited_events = events[:max_results]
@@ -350,18 +383,18 @@ class CalendarTools:
                     ],
                 ))
 
-            # Build service data
-            service_data: dict[str, Any] = {
-                "entity_id": entity_id,
+            # Build event data for the WS calendar/event/create command.
+            # Uses dtstart/dtend naming per the HA WebSocket calendar API.
+            event_data: dict[str, Any] = {
                 "summary": summary,
-                "start_date_time": start,
-                "end_date_time": end,
+                "dtstart": start,
+                "dtend": end,
             }
 
             if description:
-                service_data["description"] = description
+                event_data["description"] = description
             if location:
-                service_data["location"] = location
+                event_data["location"] = location
 
             rrule: str | None = None
             if recurrence_frequency:
@@ -379,7 +412,7 @@ class CalendarTools:
                         str(ve),
                         context={"recurrence_frequency": recurrence_frequency},
                     ))
-                service_data["rrule"] = rrule
+                event_data["rrule"] = rrule
             elif any(p is not None for p in (recurrence_interval, recurrence_count, recurrence_until, recurrence_by_day)):
                 raise_tool_error(create_error_response(
                     ErrorCode.VALIDATION_INVALID_PARAMETER,
@@ -387,8 +420,8 @@ class CalendarTools:
                     suggestions=["Set recurrence_frequency to DAILY, WEEKLY, MONTHLY, or YEARLY"],
                 ))
 
-            # Call the calendar.create_event service (REST, with WS fallback)
-            result = await _call_calendar_service(self._client, "create_event", service_data)
+            # Use the dedicated WS command (supports rrule, unlike call_service)
+            result = await _ws_calendar_create(self._client, entity_id, event_data)
 
             event_info: dict[str, Any] = {
                 "summary": summary,
@@ -500,19 +533,12 @@ class CalendarTools:
                     ],
                 ))
 
-            # Build service data
-            service_data: dict[str, Any] = {
-                "entity_id": entity_id,
-                "uid": uid,
-            }
-
-            if recurrence_id:
-                service_data["recurrence_id"] = recurrence_id
-            if recurrence_range:
-                service_data["recurrence_range"] = recurrence_range
-
-            # calendar.delete_event is WebSocket-only; helper falls back to WS on 400
-            result = await _call_calendar_service(self._client, "delete_event", service_data)
+            # Use dedicated WS command calendar/event/delete
+            result = await _ws_calendar_delete(
+                self._client, entity_id, uid,
+                recurrence_id=recurrence_id,
+                recurrence_range=recurrence_range,
+            )
 
             return {
                 "success": True,
@@ -663,21 +689,18 @@ class CalendarTools:
                     ],
                 ))
 
-            service_data: dict[str, Any] = {"entity_id": entity_id, "uid": uid}
+            # Build event data for the WS calendar/event/update command.
+            event_data: dict[str, Any] = {}
             if summary is not None:
-                service_data["summary"] = summary
+                event_data["summary"] = summary
             if description is not None:
-                service_data["description"] = description
+                event_data["description"] = description
             if location is not None:
-                service_data["location"] = location
+                event_data["location"] = location
             if start is not None:
-                service_data["start_date_time"] = start
+                event_data["dtstart"] = start
             if end is not None:
-                service_data["end_date_time"] = end
-            if recurrence_id:
-                service_data["recurrence_id"] = recurrence_id
-            if recurrence_range:
-                service_data["recurrence_range"] = recurrence_range
+                event_data["dtend"] = end
 
             if recurrence_remove and recurrence_frequency:
                 raise_tool_error(create_error_response(
@@ -687,10 +710,10 @@ class CalendarTools:
                 ))
 
             if recurrence_remove:
-                service_data["rrule"] = ""
+                event_data["rrule"] = ""
             elif recurrence_frequency:
                 try:
-                    service_data["rrule"] = _build_rrule(
+                    event_data["rrule"] = _build_rrule(
                         frequency=recurrence_frequency,
                         interval=recurrence_interval,
                         count=recurrence_count,
@@ -710,22 +733,24 @@ class CalendarTools:
                     suggestions=["Set recurrence_frequency to DAILY, WEEKLY, MONTHLY, or YEARLY"],
                 ))
 
-            if len(service_data) <= 2:
+            if not event_data:
                 raise_tool_error(create_error_response(
                     ErrorCode.VALIDATION_INVALID_PARAMETER,
                     "No fields to update. Provide at least one of: summary, description, location, start, end, recurrence_frequency, or recurrence_remove.",
                     context={"entity_id": entity_id, "uid": uid},
                 ))
 
-            result = await _call_calendar_service(self._client, "update_event", service_data)
+            result = await _ws_calendar_update(
+                self._client, entity_id, uid, event_data,
+                recurrence_id=recurrence_id,
+                recurrence_range=recurrence_range,
+            )
 
             return {
                 "success": True,
                 "entity_id": entity_id,
                 "uid": uid,
-                "updated_fields": {
-                    k: v for k, v in service_data.items() if k not in ("entity_id", "uid")
-                },
+                "updated_fields": event_data,
                 "result": result,
                 "message": f"Successfully updated event '{uid}' in {entity_id}",
             }

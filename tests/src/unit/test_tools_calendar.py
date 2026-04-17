@@ -1,61 +1,115 @@
-"""Unit tests for calendar tools transport fallback, RRULE builder, and recurrence support."""
+"""Unit tests for calendar WS API helpers, RRULE builder, and recurrence support."""
 
 from unittest.mock import AsyncMock
 
 import pytest
 from fastmcp.exceptions import ToolError
 
-from ha_mcp.tools.tools_calendar import CalendarTools, _build_rrule, _call_calendar_service
+from ha_mcp.tools.tools_calendar import (
+    CalendarTools,
+    _build_rrule,
+    _ws_calendar_create,
+    _ws_calendar_delete,
+    _ws_calendar_update,
+)
 
 
-# --- _call_calendar_service tests ---
+# --- WS calendar helper tests ---
 
 
 @pytest.mark.asyncio
-async def test_call_calendar_service_uses_websocket() -> None:
+async def test_ws_calendar_create_sends_correct_message() -> None:
     client = AsyncMock()
-    client.send_websocket_message.return_value = {"ok": True}
+    client.send_websocket_message.return_value = {"success": True}
 
-    result = await _call_calendar_service(
-        client, "create_event", {"entity_id": "calendar.x"}
-    )
+    event_data = {"summary": "Test", "dtstart": "2024-01-15T10:00:00", "dtend": "2024-01-15T11:00:00"}
+    await _ws_calendar_create(client, "calendar.test", event_data)
 
-    assert result == {"ok": True}
     client.send_websocket_message.assert_awaited_once_with(
         {
-            "type": "call_service",
-            "domain": "calendar",
-            "service": "create_event",
-            "service_data": {"entity_id": "calendar.x"},
+            "type": "calendar/event/create",
+            "entity_id": "calendar.test",
+            "event": event_data,
         }
     )
 
 
 @pytest.mark.asyncio
-async def test_call_calendar_service_passes_rrule_via_websocket() -> None:
+async def test_ws_calendar_create_passes_rrule() -> None:
     client = AsyncMock()
-    client.send_websocket_message.return_value = {"ok": True}
+    client.send_websocket_message.return_value = {"success": True}
 
-    service_data = {"entity_id": "calendar.x", "rrule": "FREQ=WEEKLY"}
-    result = await _call_calendar_service(client, "create_event", service_data)
+    event_data = {"summary": "Test", "dtstart": "2024-01-15T10:00:00", "dtend": "2024-01-15T11:00:00", "rrule": "FREQ=WEEKLY"}
+    await _ws_calendar_create(client, "calendar.test", event_data)
 
-    assert result == {"ok": True}
     sent = client.send_websocket_message.call_args[0][0]
-    assert sent["service_data"]["rrule"] == "FREQ=WEEKLY"
+    assert sent["event"]["rrule"] == "FREQ=WEEKLY"
 
 
 @pytest.mark.asyncio
-async def test_call_calendar_service_delete() -> None:
+async def test_ws_calendar_delete_sends_correct_message() -> None:
     client = AsyncMock()
-    client.send_websocket_message.return_value = {"ok": True}
+    client.send_websocket_message.return_value = {"success": True}
 
-    service_data = {"entity_id": "calendar.x", "uid": "abc"}
-    result = await _call_calendar_service(client, "delete_event", service_data)
+    await _ws_calendar_delete(client, "calendar.test", "uid-123")
 
-    assert result == {"ok": True}
+    client.send_websocket_message.assert_awaited_once_with(
+        {
+            "type": "calendar/event/delete",
+            "entity_id": "calendar.test",
+            "uid": "uid-123",
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_ws_calendar_delete_with_recurrence() -> None:
+    client = AsyncMock()
+    client.send_websocket_message.return_value = {"success": True}
+
+    await _ws_calendar_delete(
+        client, "calendar.test", "uid-123",
+        recurrence_id="20240115T100000",
+        recurrence_range="THIS_AND_FUTURE",
+    )
+
     sent = client.send_websocket_message.call_args[0][0]
-    assert sent["service"] == "delete_event"
-    assert sent["service_data"]["uid"] == "abc"
+    assert sent["recurrence_id"] == "20240115T100000"
+    assert sent["recurrence_range"] == "THIS_AND_FUTURE"
+
+
+@pytest.mark.asyncio
+async def test_ws_calendar_update_sends_correct_message() -> None:
+    client = AsyncMock()
+    client.send_websocket_message.return_value = {"success": True}
+
+    event_data = {"summary": "Updated"}
+    await _ws_calendar_update(client, "calendar.test", "uid-123", event_data)
+
+    client.send_websocket_message.assert_awaited_once_with(
+        {
+            "type": "calendar/event/update",
+            "entity_id": "calendar.test",
+            "uid": "uid-123",
+            "event": {"summary": "Updated"},
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_ws_calendar_update_with_recurrence_targeting() -> None:
+    client = AsyncMock()
+    client.send_websocket_message.return_value = {"success": True}
+
+    await _ws_calendar_update(
+        client, "calendar.test", "uid-123", {"summary": "Updated"},
+        recurrence_id="20240115T100000",
+        recurrence_range="THIS_AND_FUTURE",
+    )
+
+    sent = client.send_websocket_message.call_args[0][0]
+    assert sent["recurrence_id"] == "20240115T100000"
+    assert sent["recurrence_range"] == "THIS_AND_FUTURE"
 
 
 # --- _build_rrule tests ---
@@ -114,8 +168,7 @@ def test_build_rrule_normalizes_day_case() -> None:
 
 def _make_tools() -> tuple[CalendarTools, AsyncMock]:
     client = AsyncMock()
-    client.call_service.return_value = {"ok": True}
-    client.send_websocket_message.return_value = {"ok": True}
+    client.send_websocket_message.return_value = {"success": True}
     return CalendarTools(client), client
 
 
@@ -147,6 +200,22 @@ async def test_update_event_removes_recurrence() -> None:
 
     assert result["success"] is True
     assert result["updated_fields"]["rrule"] == ""
+
+
+@pytest.mark.asyncio
+async def test_update_event_uses_dtstart_dtend() -> None:
+    tools, client = _make_tools()
+
+    result = await tools.ha_config_update_calendar_event(
+        entity_id="calendar.family",
+        uid="event-123",
+        start="2024-01-15T10:00:00",
+        end="2024-01-15T11:00:00",
+    )
+
+    assert result["success"] is True
+    assert result["updated_fields"]["dtstart"] == "2024-01-15T10:00:00"
+    assert result["updated_fields"]["dtend"] == "2024-01-15T11:00:00"
 
 
 @pytest.mark.asyncio
@@ -204,6 +273,25 @@ async def test_create_event_includes_rrule() -> None:
 
     assert result["success"] is True
     assert result["event"]["rrule"] == "FREQ=DAILY;BYDAY=MO,TU,WE,TH,FR;UNTIL=20240331T235959Z"
+
+
+@pytest.mark.asyncio
+async def test_create_event_uses_ws_calendar_create() -> None:
+    tools, client = _make_tools()
+
+    await tools.ha_config_set_calendar_event(
+        entity_id="calendar.family",
+        summary="Dentist",
+        start="2024-01-15T10:00:00",
+        end="2024-01-15T11:00:00",
+    )
+
+    sent = client.send_websocket_message.call_args[0][0]
+    assert sent["type"] == "calendar/event/create"
+    assert sent["entity_id"] == "calendar.family"
+    assert sent["event"]["summary"] == "Dentist"
+    assert sent["event"]["dtstart"] == "2024-01-15T10:00:00"
+    assert sent["event"]["dtend"] == "2024-01-15T11:00:00"
 
 
 @pytest.mark.asyncio

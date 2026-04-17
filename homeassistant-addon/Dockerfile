@@ -12,7 +12,7 @@ WORKDIR /app
 
 # Clone the repo (uses master branch)
 # CACHE_BUST: change this value to force a fresh git clone on rebuild
-ARG CACHE_BUST=3
+ARG CACHE_BUST=4
 ARG REPO_URL=https://github.com/TomasDJo/ha-mcp.git
 ARG REPO_BRANCH=master
 RUN git clone --depth 1 --branch ${REPO_BRANCH} ${REPO_URL} /repo
